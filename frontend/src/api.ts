@@ -46,8 +46,12 @@ export async function startProcess(sessionId: string) {
   return res.json();
 }
 
-export function eventsUrl(sessionId: string) {
-  return `${API}/sessions/${sessionId}/events`;
+export function eventsUrl(sessionId: string, fromId?: string | number) {
+  const base = `${API}/sessions/${sessionId}/events`;
+  if (fromId !== undefined && fromId !== null && String(fromId).length > 0) {
+    return `${base}?from=${encodeURIComponent(String(fromId))}`;
+  }
+  return base;
 }
 
 export async function downloadZip(sessionId: string) {

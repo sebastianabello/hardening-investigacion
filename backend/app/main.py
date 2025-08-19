@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, status, BackgroundTasks, Query
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi import status
@@ -87,6 +88,12 @@ def start_processing(req: ProcessRequest, bg: BackgroundTasks):
     s = session_paths(req.session_id)
     if not os.path.exists(s["base"]):
         raise HTTPException(404, "Session not found")
+
+    # 🔒 evita doble inicio si ya corre
+    if bus.get_status(req.session_id) == "running":
+        bus.push(req.session_id, "info", "Procesamiento ya en ejecución; ignorado nuevo inicio")
+        return {"ok": True, "already_running": True}
+
     uploads = [os.path.join(s["uploads"], f) for f in os.listdir(s["uploads"]) if not f.endswith(".part")]
     if not uploads:
         raise HTTPException(400, "No hay archivos subidos")
@@ -98,8 +105,11 @@ def start_processing(req: ProcessRequest, bg: BackgroundTasks):
     def work():
         try:
             bus.status(req.session_id, "running")
+            bus.push(req.session_id, "info", f"Comenzando procesamiento de {len(uploads)} archivo(s)")
             for p in uploads:
+                bus.push(req.session_id, "info", f"Abriendo {os.path.basename(p)}")
                 parse_report_file(p, s["outputs"], cliente_default, req.session_id)
+                bus.push(req.session_id, "success", f"Finalizado {os.path.basename(p)}")
             bus.push(req.session_id, "success", "Procesamiento completado")
             bus.status(req.session_id, "done")
         except Exception as e:
@@ -111,8 +121,10 @@ def start_processing(req: ProcessRequest, bg: BackgroundTasks):
 
 # --- Progreso (SSE) ---
 @app.get("/sessions/{session_id}/events")
-def stream_events(session_id: str):
-    return StreamingResponse(bus.stream(session_id), media_type="text/event-stream")
+def stream_events(session_id: str, from_: int | None = Query(default=None, alias="from")):
+    # Si el cliente pasa ?from=42, empezamos en 43
+    start_from = (from_ + 1) if (from_ is not None and from_ >= 0) else 0
+    return StreamingResponse(bus.stream(session_id, start_from=start_from), media_type="text/event-stream")
 
 # --- Descarga de resultados ---
 @app.get("/sessions/{session_id}/results.zip")

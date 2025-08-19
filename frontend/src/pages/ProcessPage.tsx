@@ -1,20 +1,29 @@
 import React, { useEffect, useRef, useState } from "react";
-import { createSession, eventsUrl, startProcess, downloadZip, ingestES } from "../api";
+import { createSession, startProcess, downloadZip, ingestES } from "../api";
 import { StepIndicator } from "../components/StepIndicator";
 import { ChunkedUploader } from "../components/ChunkedUploader";
 
+/**
+ * Vista principal: wizard para subir CSV de Qualys, procesarlos y enviar a Elasticsearch.
+ * - Conexión SSE con cursor (?from=<lastId>) para evitar replays de eventos.
+ * - Botón de "Iniciar procesamiento" con candado para evitar dobles envíos.
+ * - Logs en vivo y pasos del flujo.
+ */
+
 export default function ProcessPage() {
+  // Datos de sesión / cliente
   const [cliente, setCliente] = useState("");
   const [subcliente, setSubcliente] = useState("");
+
+  // Control de sesión y pasos (1=Cliente, 2=Subir, 3=Procesar, 4=Validar/Descargar/ES)
   const [session, setSession] = useState<string | null>(null);
+  const [step, setStep] = useState<number>(1);
 
-  // Pasos del wizard:
-  // 1 = Cliente, 2 = Subir, 3 = Procesar, 4 = Validar/Descargar/ES
-  const [step, setStep] = useState(1);
-
+  // Logs y estado de ejecución
   const [log, setLog] = useState<string[]>([]);
-  const [processing, setProcessing] = useState(false);
+  const [processing, setProcessing] = useState<boolean>(false);
 
+  // Índices de ES
   const [indices, setIndices] = useState({
     t1n: "qualys_t1_normal",
     t1a: "qualys_t1_ajustada",
@@ -22,32 +31,41 @@ export default function ProcessPage() {
     t2a: "qualys_t2_ajustada",
   });
 
-  // === SSE: una sola conexión + deduplicación por event ID ===
+  // === SSE (una sola conexión) con cursor para no repetir historial ===
   const esRef = useRef<EventSource | null>(null);
-  const seenIds = useRef<Set<string>>(new Set());
+  const lastIdRef = useRef<string | null>(null);
+  const reconnectTimer = useRef<number | null>(null);
 
-  useEffect(() => {
-    if (!session) return;
+  // Construye URL del SSE usando el cursor (usamos el proxy /api del Nginx)
+  function buildEventsUrl(sessionId: string, fromId?: string | number) {
+    const base = `/api/sessions/${sessionId}/events`;
+    if (fromId !== undefined && fromId !== null && String(fromId).length > 0) {
+      return `${base}?from=${encodeURIComponent(String(fromId))}`;
+    }
+    return base;
+  }
 
-    // Cierra previa si existe (defensa)
+  function openSSE(sess: string) {
+    // Cerrar/consolidar conexión previa
     if (esRef.current) {
       esRef.current.close();
       esRef.current = null;
     }
-    seenIds.current.clear();
+    if (reconnectTimer.current) {
+      window.clearTimeout(reconnectTimer.current);
+      reconnectTimer.current = null;
+    }
 
-    const es = new EventSource(eventsUrl(session));
+    const url = buildEventsUrl(sess, lastIdRef.current ?? undefined);
+    const es = new EventSource(url);
     esRef.current = es;
 
     es.onmessage = (e: MessageEvent) => {
-      // Dedupe por ID (el backend ahora envía "id: <n>")
-      const id = (e as MessageEvent).lastEventId || "";
-      if (id) {
-        if (seenIds.current.has(id)) return;
-        seenIds.current.add(id);
-      }
-      const msg = String(e.data || "");
+      // Guardamos el ID del evento para reanudar si se corta
+      const evId = (e as MessageEvent).lastEventId || null;
+      if (evId) lastIdRef.current = evId;
 
+      const msg = String(e.data ?? "");
       setLog((prev) => [...prev, msg]);
 
       if (msg === "status|done") {
@@ -59,27 +77,37 @@ export default function ProcessPage() {
     };
 
     es.onerror = () => {
-      // Cierra para evitar múltiples reconexiones en background
+      // Reconexión con backoff corto usando el cursor guardado
       es.close();
       esRef.current = null;
+      reconnectTimer.current = window.setTimeout(() => openSSE(sess), 1000);
     };
+  }
 
-    // Limpieza al desmontar / cambiar de sesión
+  useEffect(() => {
+    if (!session) return;
+
+    // Al cambiar de sesión, reiniciamos cursor y log
+    lastIdRef.current = null;
+    setLog([]);
+    openSSE(session);
+
     return () => {
-      es.close();
+      if (esRef.current) esRef.current.close();
+      if (reconnectTimer.current) window.clearTimeout(reconnectTimer.current);
       esRef.current = null;
-      seenIds.current.clear();
+      reconnectTimer.current = null;
     };
   }, [session]);
 
-  async function start() {
+  // === Handlers ===
+  async function handleCreateSession() {
     try {
       const { session_id } = await createSession(cliente || "DEFAULT", subcliente || undefined);
       setSession(session_id);
       setStep(2);
       setLog([]);
-    } catch (err) {
-      console.error(err);
+    } catch {
       setLog((prev) => [...prev, "error|No se pudo crear la sesión"]);
     }
   }
@@ -89,9 +117,8 @@ export default function ProcessPage() {
     try {
       setProcessing(true);
       await startProcess(session);
-      // El cambio de step a 4 lo hace el SSE cuando reciba "status|done"
-    } catch (err) {
-      console.error(err);
+      // El avance se refleja por SSE; al terminar llega "status|done"
+    } catch {
       setProcessing(false);
       setLog((prev) => [...prev, "error|Fallo al iniciar el procesamiento"]);
     }
@@ -101,8 +128,7 @@ export default function ProcessPage() {
     if (!session) return;
     try {
       await downloadZip(session);
-    } catch (err) {
-      console.error(err);
+    } catch {
       setLog((prev) => [...prev, "warning|Aún no hay resultados para descargar"]);
     }
   }
@@ -112,17 +138,18 @@ export default function ProcessPage() {
     try {
       const res = await ingestES(session, indices);
       setLog((prev) => [...prev, `success|Ingesta completada ${JSON.stringify(res.stats)}`]);
-    } catch (err) {
-      console.error(err);
+    } catch {
       setLog((prev) => [...prev, "error|Fallo al subir a Elasticsearch"]);
     }
   }
 
+  // === Render ===
   return (
     <div className="max-w-4xl mx-auto p-6">
       <h1 className="text-2xl font-bold mb-4">Procesar reportes de Qualys</h1>
       <StepIndicator step={step} />
 
+      {/* Paso 1: Selección de cliente */}
       {step === 1 && (
         <div className="space-y-3">
           <input
@@ -137,12 +164,13 @@ export default function ProcessPage() {
             value={subcliente}
             onChange={(e) => setSubcliente(e.target.value)}
           />
-          <button onClick={start} className="px-4 py-2 bg-black text-white rounded">
+          <button onClick={handleCreateSession} className="px-4 py-2 bg-black text-white rounded">
             Crear sesión
           </button>
         </div>
       )}
 
+      {/* Paso 2: Subida de archivos */}
       {step === 2 && session && (
         <div className="space-y-3">
           <ChunkedUploader
@@ -155,6 +183,7 @@ export default function ProcessPage() {
         </div>
       )}
 
+      {/* Paso 3: Procesamiento */}
       {step === 3 && session && (
         <div className="space-y-3">
           <div className="flex items-center gap-2">
@@ -167,7 +196,7 @@ export default function ProcessPage() {
             >
               {processing ? "Procesando..." : "Iniciar procesamiento"}
             </button>
-            {processing && <span className="text-sm text-gray-600">No cierres esta página hasta finalizar.</span>}
+            {processing && <span className="text-sm text-gray-600">Procesando… no cierres la página.</span>}
           </div>
 
           <div className="p-3 bg-gray-50 rounded h-56 overflow-auto text-sm border">
@@ -178,10 +207,14 @@ export default function ProcessPage() {
         </div>
       )}
 
+      {/* Paso 4: Descarga e ingesta */}
       {step >= 4 && session && (
         <div className="space-y-4">
           <div className="flex gap-2">
-            <button onClick={handleDownload} className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700">
+            <button
+              onClick={handleDownload}
+              className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700"
+            >
               Descargar CSVs
             </button>
           </div>
