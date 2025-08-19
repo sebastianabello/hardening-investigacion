@@ -1,0 +1,43 @@
+version: "3.9"
+
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: qualys-api
+    env_file:
+      - ./backend/.env
+    volumes:
+      - sessions:/tmp/app/sessions
+      # En desarrollo puedes montar el código para hot-reload:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/docs"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks:
+      - appnet
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API: /api
+    container_name: qualys-web
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+    networks:
+      - appnet
+
+volumes:
+  sessions:
+
+networks:
+  appnet:
