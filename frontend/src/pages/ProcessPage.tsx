@@ -4,10 +4,10 @@ import { StepIndicator } from "../components/StepIndicator";
 import { ChunkedUploader } from "../components/ChunkedUploader";
 
 /**
- * Vista principal: wizard para subir CSV de Qualys, procesarlos y enviar a Elasticsearch.
- * - Conexión SSE con cursor (?from=<lastId>) para evitar replays de eventos.
- * - Botón de "Iniciar procesamiento" con candado para evitar dobles envíos.
- * - Logs en vivo y pasos del flujo.
+ * Vista principal con SSE robusto:
+ * - Cursor (?from=<lastId>) + dedupe por eventId
+ * - No reconecta después de status|done / status|error
+ * - Candado para evitar doble procesamiento
  */
 
 export default function ProcessPage() {
@@ -15,11 +15,11 @@ export default function ProcessPage() {
   const [cliente, setCliente] = useState("");
   const [subcliente, setSubcliente] = useState("");
 
-  // Control de sesión y pasos (1=Cliente, 2=Subir, 3=Procesar, 4=Validar/Descargar/ES)
+  // Control de sesión y pasos (1=Cliente, 2=Subir, 3=Procesar, 4=Descargar/ES)
   const [session, setSession] = useState<string | null>(null);
   const [step, setStep] = useState<number>(1);
 
-  // Logs y estado de ejecución
+  // Logs y estado
   const [log, setLog] = useState<string[]>([]);
   const [processing, setProcessing] = useState<boolean>(false);
 
@@ -31,12 +31,13 @@ export default function ProcessPage() {
     t2a: "qualys_t2_ajustada",
   });
 
-  // === SSE (una sola conexión) con cursor para no repetir historial ===
+  // === SSE (una sola conexión), cursor y deduplicación ===
   const esRef = useRef<EventSource | null>(null);
   const lastIdRef = useRef<string | null>(null);
+  const seenIdsRef = useRef<Set<string>>(new Set());
   const reconnectTimer = useRef<number | null>(null);
+  const finishedRef = useRef<boolean>(false); // evita reconectar tras done/error
 
-  // Construye URL del SSE usando el cursor (usamos el proxy /api del Nginx)
   function buildEventsUrl(sessionId: string, fromId?: string | number) {
     const base = `/api/sessions/${sessionId}/events`;
     if (fromId !== undefined && fromId !== null && String(fromId).length > 0) {
@@ -45,8 +46,7 @@ export default function ProcessPage() {
     return base;
   }
 
-  function openSSE(sess: string) {
-    // Cerrar/consolidar conexión previa
+  function closeSSE() {
     if (esRef.current) {
       esRef.current.close();
       esRef.current = null;
@@ -55,31 +55,50 @@ export default function ProcessPage() {
       window.clearTimeout(reconnectTimer.current);
       reconnectTimer.current = null;
     }
+  }
+
+  function openSSE(sess: string) {
+    closeSSE(); // asegura una única conexión
 
     const url = buildEventsUrl(sess, lastIdRef.current ?? undefined);
     const es = new EventSource(url);
     esRef.current = es;
 
     es.onmessage = (e: MessageEvent) => {
-      // Guardamos el ID del evento para reanudar si se corta
-      const evId = (e as MessageEvent).lastEventId || null;
-      if (evId) lastIdRef.current = evId;
+      const evId = (e as MessageEvent).lastEventId || ""; // viene del backend "id: <n>"
+      if (evId) {
+        if (seenIdsRef.current.has(evId)) return; // dedupe por ID
+        seenIdsRef.current.add(evId);
+        lastIdRef.current = evId; // cursor para reconexiones
+      }
 
       const msg = String(e.data ?? "");
+      // Evita duplicar status ya finalizado
+      if (finishedRef.current && (msg === "status|done" || msg === "status|error")) return;
+
       setLog((prev) => [...prev, msg]);
 
       if (msg === "status|done") {
+        finishedRef.current = true;
         setProcessing(false);
         setStep(4);
+        closeSSE(); // no reconectar más
       } else if (msg === "status|error") {
+        finishedRef.current = true;
         setProcessing(false);
+        closeSSE();
       }
     };
 
     es.onerror = () => {
-      // Reconexión con backoff corto usando el cursor guardado
+      // Si ya terminó, no reconectar
+      if (finishedRef.current) {
+        closeSSE();
+        return;
+      }
       es.close();
       esRef.current = null;
+      // Reconexión con backoff corto usando el cursor guardado
       reconnectTimer.current = window.setTimeout(() => openSSE(sess), 1000);
     };
   }
@@ -87,16 +106,17 @@ export default function ProcessPage() {
   useEffect(() => {
     if (!session) return;
 
-    // Al cambiar de sesión, reiniciamos cursor y log
+    // Nueva sesión: reset de cursor/dedupe/estado
     lastIdRef.current = null;
+    seenIdsRef.current.clear();
+    finishedRef.current = false;
     setLog([]);
+
     openSSE(session);
 
     return () => {
-      if (esRef.current) esRef.current.close();
-      if (reconnectTimer.current) window.clearTimeout(reconnectTimer.current);
-      esRef.current = null;
-      reconnectTimer.current = null;
+      closeSSE();
+      seenIdsRef.current.clear();
     };
   }, [session]);
 
@@ -116,8 +136,9 @@ export default function ProcessPage() {
     if (!session || processing) return;
     try {
       setProcessing(true);
+      finishedRef.current = false; // por si re-procesas en una nueva sesión
       await startProcess(session);
-      // El avance se refleja por SSE; al terminar llega "status|done"
+      // Progreso vía SSE; al finalizar llega "status|done"
     } catch {
       setProcessing(false);
       setLog((prev) => [...prev, "error|Fallo al iniciar el procesamiento"]);
@@ -207,7 +228,7 @@ export default function ProcessPage() {
         </div>
       )}
 
-      {/* Paso 4: Descarga e ingesta */}
+      {/* Paso 4: Descarga e Ingesta */}
       {step >= 4 && session && (
         <div className="space-y-4">
           <div className="flex gap-2">
