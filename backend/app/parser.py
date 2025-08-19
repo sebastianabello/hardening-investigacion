@@ -2,16 +2,23 @@ import csv, io, os, re
 from typing import Optional, Dict, List, Tuple
 from .progress import bus
 
-MARK_T1 = re.compile(r"^\s*Control\s+Statistics\s*$", re.I)
-MARK_T2 = re.compile(r"^\s*RESULTS\s*$", re.I)
+# === Marcadores flexibles ===
+MARK_T1 = re.compile(r"Control\s+Statistics", re.I)          # permite sufijos "(Percentage ...)"
+MARK_T2 = re.compile(r'^\s*"?RESULTS"?\s*$', re.I)           # tolera comillas/espacios
 MARK_ADJ = re.compile(r"\b(AJUSTADA|AJU)\b", re.I)
-MARK_DC  = re.compile(r"DOMAIN\s+CONTROL+ER", re.I)  # matches CONTROLER / CONTROLLER
+MARK_DC  = re.compile(r"DOMAIN\s+CONTROL+ER", re.I)           # CONTROLER/CONTROLLER
 
+# Cortes de sección para no “arrastrar” líneas fuera de la tabla
+SECTION_STOP_RE = re.compile(
+    r'^\s*("?SUMMARY"?|"?ASSET\s+TAGS"?|ASSETS\b|POLICY\s+ID\b|CIS\s+Benchmark|roles\b|ubica\b)',
+    re.I
+)
+
+# === Utils de metadata / normalización ===
 def _detect_metadata(head_lines: List[str]) -> Dict[str, Optional[str]]:
-    head = "\n".join(head_lines[:50])
+    head = "\n".join(head_lines[:80])
     adjusted = bool(MARK_ADJ.search(head))
     has_dc   = bool(MARK_DC.search(head))
-    # cliente/subcliente heurísticos
     cliente = None
     subcliente = None
     m_cli = re.search(r"(?:Cliente|Client|Customer)\s*[:\-]\s*(.+)", head, re.I)
@@ -27,49 +34,82 @@ def _norm_os_value(val: str, has_dc_flag: bool) -> str:
         return val
     return (val or "") + " domain controller"
 
+def _strip_cell(s: str) -> str:
+    # Limpia comillas y espacios comunes en encabezados de Qualys
+    return (s or "").strip().strip('"').strip()
+
+def _norm_header(cols: List[str]) -> List[str]:
+    return [_strip_cell(c) for c in cols]
+
+def _ensure_cliente_last(header: List[str]) -> List[str]:
+    # Garantiza exactamente una columna "Cliente" al final
+    out = [h for h in header if h.strip().lower() != "cliente"]
+    out.append("Cliente")
+    return out
+
+def _read_existing_header(path: str) -> Optional[List[str]]:
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        try:
+            rdr = csv.reader(f)
+            row = next(rdr)
+            return _norm_header(row) if row else None
+        except StopIteration:
+            return None
+
+# === Núcleo ===
 def parse_report_file(
     filepath: str,
     outputs_dir: str,
     cliente_por_defecto: str,
     session_id: str,
 ) -> Dict[str, int]:
-    """
-    Lee un CSV gigante de Qualys en streaming y escribe filas en 4 archivos:
-    t1_normal.csv, t1_ajustada.csv, t2_normal.csv, t2_ajustada.csv
-    Devuelve contadores por salida.
-    """
+
     counts = {"t1_normal":0, "t1_ajustada":0, "t2_normal":0, "t2_ajustada":0}
-    # Abrir writers en modo append; escribimos encabezado en la primera vez que no exista
     out_paths = {
         "t1_normal":   os.path.join(outputs_dir, "t1_normal.csv"),
         "t1_ajustada": os.path.join(outputs_dir, "t1_ajustada.csv"),
         "t2_normal":   os.path.join(outputs_dir, "t2_normal.csv"),
         "t2_ajustada": os.path.join(outputs_dir, "t2_ajustada.csv"),
     }
+
+    # Abrir writers y fijar header canónico si ya existe
     out_handles: Dict[str, Tuple[io.TextIOBase, csv.writer, Optional[List[str]]]] = {}
     for k, p in out_paths.items():
-        first = not os.path.exists(p)
+        first = not os.path.exists(p) or os.path.getsize(p) == 0
+        # Si el archivo ya tiene contenido, leemos el header existente y lo reusamos
+        existing_header = _read_existing_header(p)
         f = open(p, "a+", encoding="utf-8", newline="")
         w = csv.writer(f)
-        out_handles[k] = (f, w, None)  # header cache
-        if first:
-            # header aún no conocido; se escribirá cuando detectemos el de la tabla
-            pass
+        out_handles[k] = (f, w, existing_header)  # cache del header canónico
+        # No escribimos header aquí; lo haremos al primer ensure_header() si no existía
 
-    def ensure_header(key: str, header: List[str]):
-        # Asegura columna "Cliente"
-        if not any(h.strip().lower() == "cliente" for h in header):
-            header = header + ["Cliente"]
+    def _bucket(is_t1: bool, adjusted: bool) -> str:
+        if is_t1:
+            return "t1_ajustada" if adjusted else "t1_normal"
+        return "t2_ajustada" if adjusted else "t2_normal"
+
+    def ensure_header(key: str, incoming_header: List[str]) -> List[str]:
+        """
+        Retorna el header canónico para el bucket.
+        - Si ya existe: lo reutiliza.
+        - Si no existe: toma el del primer bloque, lo normaliza y añade "Cliente" al final, lo escribe.
+        """
         f, w, cached = out_handles[key]
-        if cached is None:
-            w.writerow(header)
-            out_handles[key] = (f, w, header)
-        return out_handles[key][2]
+        if cached is not None:
+            return cached
 
-    # Leer primeras líneas para metadatos
+        # No existía: normalizamos y fijamos header inicial
+        norm_in = _norm_header(incoming_header)
+        canon = _ensure_cliente_last(norm_in)
+        w.writerow(canon)               # se escribe una única vez por archivo de salida
+        out_handles[key] = (f, w, canon)
+        return canon
+
+    # Lee cabecera del archivo (para metadata) sin consumir todo el stream
     head_lines: List[str] = []
     with open(filepath, "r", encoding="utf-8-sig", errors="replace") as fh:
-        # “Prime” primeras N líneas sin consumir el archivo completo
         for _ in range(80):
             pos = fh.tell()
             line = fh.readline()
@@ -78,102 +118,123 @@ def parse_report_file(
             head_lines.append(line)
             if len(head_lines) >= 80:
                 break
-        # Recolocar al inicio para procesar completo
         fh.seek(0)
         md = _detect_metadata(head_lines)
 
         # Estados
         IN_NONE, IN_T1_WAIT_HEADER, IN_T1_DATA, IN_T2_WAIT_HEADER, IN_T2_DATA = range(5)
         state = IN_NONE
-        current_header: Optional[List[str]] = None
+
+        # Variables del bloque actual
+        current_in_header: Optional[List[str]] = None   # header detectado en el bloque
+        current_dest_header: Optional[List[str]] = None # header canónico del bucket
+        current_bucket: Optional[str] = None
         t2_os_idx: Optional[int] = None
 
-        def select_bucket(is_t1: bool, adjusted: bool) -> str:
-            if is_t1:
-                return "t1_ajustada" if adjusted else "t1_normal"
-            return "t2_ajustada" if adjusted else "t2_normal"
+        # Función para mapear filas entrantes → header canónico (sin “Cliente”)
+        def map_row_to_canon(row: List[str]) -> List[str]:
+            assert current_in_header is not None and current_dest_header is not None
+            # Mapa source
+            src_names = [_strip_cell(c).lower() for c in current_in_header]
+            src_map = {name: idx for idx, name in enumerate(src_names)}
+            # Dest sin “Cliente”
+            dest_cols = [c for c in current_dest_header if c.strip().lower() != "cliente"]
+            out = []
+            for col in dest_cols:
+                idx = src_map.get(col.strip().lower())
+                val = row[idx] if (idx is not None and idx < len(row)) else ""
+                out.append(val)
+            # Añade Cliente
+            cliente = md["subcliente"] or md["cliente"] or cliente_por_defecto
+            out.append(cliente)
+            return out
 
         for raw in fh:
             line = raw.rstrip("\r\n")
-            # Transiciones por marcador
+
+            # Transiciones por marcadores (T1 por "search"; T2 por "match")
             if state in (IN_NONE, IN_T1_DATA, IN_T2_DATA):
-                if MARK_T1.match(line):
+                if MARK_T1.search(line):
                     state = IN_T1_WAIT_HEADER
-                    current_header = None
+                    current_in_header = None
+                    current_dest_header = None
+                    current_bucket = None
                     t2_os_idx = None
                     continue
                 if MARK_T2.match(line):
                     state = IN_T2_WAIT_HEADER
-                    current_header = None
+                    current_in_header = None
+                    current_dest_header = None
+                    current_bucket = None
                     t2_os_idx = None
                     continue
 
+            # Header de T1
             if state == IN_T1_WAIT_HEADER:
-                # La línea actual es el header de T1
                 try:
-                    current_header = next(csv.reader([line]))
+                    current_in_header = next(csv.reader([line]))
                 except Exception:
-                    current_header = [c.strip() for c in line.split(",")]
-                bucket = select_bucket(is_t1=True, adjusted=md["adjusted"])
-                header = ensure_header(bucket, current_header)
+                    current_in_header = [c.strip() for c in line.split(",")]
+                current_bucket = _bucket(True, md["adjusted"])
+                current_dest_header = ensure_header(current_bucket, current_in_header)
                 state = IN_T1_DATA
                 continue
 
+            # Header de T2
             if state == IN_T2_WAIT_HEADER:
                 try:
-                    current_header = next(csv.reader([line]))
+                    current_in_header = next(csv.reader([line]))
                 except Exception:
-                    current_header = [c.strip() for c in line.split(",")]
-                # detectar índice de 'operating system' (case-insensitive)
+                    current_in_header = [c.strip() for c in line.split(",")]
+                # índice de operating system (case-insensitive) en header entrante
                 t2_os_idx = None
-                for idx, col in enumerate(current_header):
-                    if col.strip().lower() == "operating system":
+                for idx, col in enumerate(current_in_header):
+                    if _strip_cell(col).lower() == "operating system":
                         t2_os_idx = idx
                         break
-                bucket = select_bucket(is_t1=False, adjusted=md["adjusted"])
-                header = ensure_header(bucket, current_header)
+                current_bucket = _bucket(False, md["adjusted"])
+                current_dest_header = ensure_header(current_bucket, current_in_header)
                 state = IN_T2_DATA
                 continue
 
+            # Filas de T1
             if state == IN_T1_DATA:
-                if not line.strip():
-                    # pos fin de bloque
+                # Corte si comienza otra sección o línea vacía
+                if not line.strip() or SECTION_STOP_RE.search(line):
                     state = IN_NONE
                     continue
                 row = next(csv.reader([line]))
-                # añadir Cliente al final si no venía
-                if len(row) < len(current_header):
-                    # filas cortadas — rellenar
-                    row = row + [""] * (len(current_header) - len(row))
-                cliente = md["subcliente"] or md["cliente"] or cliente_por_defecto
-                row_out = row + [cliente]
-                f, w, _ = out_handles[select_bucket(True, md["adjusted"])]
-                w.writerow(row_out)
+                # Rellenar si viene más corta que su propio header entrante
+                if current_in_header and len(row) < len(current_in_header):
+                    row = row + [""] * (len(current_in_header) - len(row))
+                # Alinear a header canónico y escribir
+                f, w, _ = out_handles[current_bucket]  # type: ignore[arg-type]
+                w.writerow(map_row_to_canon(row))
                 counts["t1_ajustada" if md["adjusted"] else "t1_normal"] += 1
                 continue
 
+            # Filas de T2
             if state == IN_T2_DATA:
-                if not line.strip():
+                if not line.strip() or SECTION_STOP_RE.search(line):
                     state = IN_NONE
                     continue
                 row = next(csv.reader([line]))
-                if len(row) < len(current_header):
-                    row = row + [""] * (len(current_header) - len(row))
-                if t2_os_idx is not None:
+                if current_in_header and len(row) < len(current_in_header):
+                    row = row + [""] * (len(current_in_header) - len(row))
+                # Ajuste de OS si aplica
+                if t2_os_idx is not None and t2_os_idx < len(row):
                     row[t2_os_idx] = _norm_os_value(row[t2_os_idx], md["has_dc"])
-                cliente = md["subcliente"] or md["cliente"] or cliente_por_defecto
-                row_out = row + [cliente]
-                f, w, _ = out_handles[select_bucket(False, md["adjusted"])]
-                w.writerow(row_out)
+                f, w, _ = out_handles[current_bucket]  # type: ignore[arg-type]
+                w.writerow(map_row_to_canon(row))
                 counts["t2_ajustada" if md["adjusted"] else "t2_normal"] += 1
                 continue
 
-    # Cerrar
+    # Cierre
     for f, _, _ in out_handles.values():
         f.close()
 
-    # Log a progreso
-    bus.push(session_id, "info", f"Procesado {os.path.basename(filepath)}  "
-                                 f"(T1N={counts['t1_normal']}, T1A={counts['t1_ajustada']}, "
-                                 f"T2N={counts['t2_normal']}, T2A={counts['t2_ajustada']})")
+    bus.push(session_id, "info",
+             f"Procesado {os.path.basename(filepath)} "
+             f"(T1N={counts['t1_normal']}, T1A={counts['t1_ajustada']}, "
+             f"T2N={counts['t2_normal']}, T2A={counts['t2_ajustada']})")
     return counts
