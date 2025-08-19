@@ -29,10 +29,13 @@ class ProgressBus:
                 status = self._state.get(session_id, {}).get("status", "unknown")
             while last_idx < len(evts):
                 e = evts[last_idx]
-                yield f"data: {e['level']}|{e['message']}\n\n"
+                # 🔹 Enviamos un ID de evento incremental y el timestamp para que el front dedupe
+                yield f"id: {last_idx}\n" \
+                      f"data: {e['ts']}|{e['level']}|{e['message']}\n\n"
                 last_idx += 1
             if status in ("done", "error"):
-                yield f"data: status|{status}\n\n"
+                yield f"id: {last_idx}\n" \
+                      f"data: status|{status}\n\n"
                 break
             time.sleep(0.5)
 

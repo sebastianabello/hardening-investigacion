@@ -6,11 +6,21 @@ from .progress import bus
 MARK_T1 = re.compile(r"Control\s+Statistics", re.I)          # permite sufijos "(Percentage ...)"
 MARK_T2 = re.compile(r'^\s*"?RESULTS"?\s*$', re.I)           # tolera comillas/espacios
 MARK_ADJ = re.compile(r"\b(AJUSTADA|AJU)\b", re.I)
-MARK_DC  = re.compile(r"DOMAIN\s+CONTROL+ER", re.I)           # CONTROLER/CONTROLLER
+MARK_DC  = re.compile(r"DOMAIN\s+CONTROL+ER", re.I)           # CONTROLER/CONTROLLER (tolerante)
 
 # Cortes de sección (líneas que indican fin de la tabla en curso)
 SECTION_STOP_RE = re.compile(
-    r'^\s*("?SUMMARY"?|"?ASSET\s+TAGS"?|ASSETS\b|POLICY\s+ID\b|CIS\s+Benchmark|roles\b|ubica\b)',
+    r'^\s*('
+    r'"?SUMMARY"?|"?ASSET\s+TAGS"?|ASSETS\b|POLICY\s+ID\b|'
+    r'CIS\s+Benchmark|roles\b|ubica\b|'
+    r'HOST\s+STATISTICS(?:\s*\(.*\))?'   # Host Statistics (...) → fuera de T1/T2
+    r')',
+    re.I
+)
+
+# Ruido típico de logs/errores que a veces aparecen tras RESULTS
+STOP_LOG_RE = re.compile(
+    r'^\s*(ERROR|ERR|WARN|WARNING|INFO|DEBUG|TRACE|EXCEPTION|TRACEBACK|Caused by:|at\s+\S+\.|java\.|org\.)',
     re.I
 )
 
@@ -60,6 +70,7 @@ class TableIterator:
     Iterador que lee líneas desde fh y se detiene ANTES de:
       - línea vacía,
       - SECTION_STOP_RE,
+      - STOP_LOG_RE,
       - aparición de otro marcador de tabla (T1/T2).
     Reposiciona fh para que la línea de stop se procese por el bucle externo.
     """
@@ -80,11 +91,16 @@ class TableIterator:
             self._done = True
             raise StopIteration
         if self.stop_predicate(line):
-            # Devolvemos el puntero al inicio de la línea que marca el fin
             self.fh.seek(pos)
             self._done = True
             raise StopIteration
         return line
+
+def _t2_header_is_valid(cols: List[str]) -> bool:
+    # Requisitos mínimos para considerar que "RESULTS" realmente inicia T2
+    must_have_any = {"host ip", "operating system", "control id", "status"}
+    norm = { _strip_cell(c).lower() for c in cols }
+    return len(must_have_any & norm) > 0
 
 def parse_report_file(
     filepath: str,
@@ -156,9 +172,9 @@ def parse_report_file(
                 break
             stripped = line.rstrip("\r\n")
 
-            # Buscar inicio de T1
+            # Inicio de T1
             if MARK_T1.search(stripped):
-                # Header de T1 está en la siguiente línea
+                # Header en la siguiente línea
                 header_line = fh.readline()
                 if not header_line:
                     continue
@@ -170,26 +186,30 @@ def parse_report_file(
                 canon = ensure_header(bucket, in_header)
                 map_row = make_row_mapper(in_header, canon, cliente_val)
 
-                # Iterar filas de T1 hasta el próximo corte
                 def stop_pred(l: str) -> bool:
                     if not l.strip(): return True
                     if SECTION_STOP_RE.search(l): return True
+                    if STOP_LOG_RE.search(l): return True
                     if MARK_T1.search(l) or MARK_T2.match(l): return True
                     return False
 
                 rdr = csv.reader(TableIterator(fh, stop_pred))
                 f, w, _ = out_handles[bucket]
+                bad = 0
                 for row in rdr:
-                    if in_header and len(row) < len(in_header):
-                        row = row + [""] * (len(in_header) - len(row))
+                    if in_header and len(row) != len(in_header):
+                        bad += 1
+                        if bad >= 3:
+                            break
+                        continue
+                    bad = 0
                     w.writerow(map_row(row))
                     counts["t1_ajustada" if md["adjusted"] else "t1_normal"] += 1
-                # Continúa el while; el fh quedó posicionado en la línea del corte
                 continue
 
-            # Buscar inicio de T2 (RESULTS exacto/comillas toleradas)
+            # Inicio de T2
             if MARK_T2.match(stripped):
-                # Header de T2 en la siguiente línea
+                # Header en la siguiente línea
                 header_line = fh.readline()
                 if not header_line:
                     continue
@@ -197,6 +217,12 @@ def parse_report_file(
                     in_header = next(csv.reader([header_line]))
                 except Exception:
                     in_header = [c.strip() for c in header_line.split(",")]
+
+                # Validación mínima del header de T2
+                if not _t2_header_is_valid(in_header):
+                    bus.push(session_id, "warning", "Encabezado T2 inválido tras RESULTS; bloque ignorado")
+                    # saltamos este bloque: seguimos el while principal
+                    continue
 
                 # Índice de Operating System (case-ins)
                 os_idx = None
@@ -212,22 +238,27 @@ def parse_report_file(
                 def stop_pred(l: str) -> bool:
                     if not l.strip(): return True
                     if SECTION_STOP_RE.search(l): return True
+                    if STOP_LOG_RE.search(l): return True
                     if MARK_T1.search(l) or MARK_T2.match(l): return True
                     return False
 
                 rdr = csv.reader(TableIterator(fh, stop_pred))
                 f, w, _ = out_handles[bucket]
+                bad = 0
                 for row in rdr:
-                    if in_header and len(row) < len(in_header):
-                        row = row + [""] * (len(in_header) - len(row))
+                    if in_header and len(row) != len(in_header):
+                        bad += 1
+                        if bad >= 3:
+                            break
+                        continue
+                    bad = 0
                     if os_idx is not None and os_idx < len(row):
                         row[os_idx] = _norm_os_value(row[os_idx], md["has_dc"])
                     w.writerow(map_row(row))
                     counts["t2_ajustada" if md["adjusted"] else "t2_normal"] += 1
                 continue
 
-            # Si no es inicio de ninguna tabla, seguimos avanzando
-            # (no hacemos seek atrás para evitar bucles infinitos)
+            # Si no es inicio de ninguna tabla, seguimos
             continue
 
     # Cerrar archivos
